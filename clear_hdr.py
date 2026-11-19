@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Remove explicitly identified JPEG gain maps from Finder selections."""
+"""Remove explicitly identified JPEG gain maps from selected images and folders."""
 
 import argparse
 import ctypes
@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat as stat_flags
 import subprocess
 import sys
 import tempfile
@@ -16,8 +17,10 @@ import tempfile
 TITLE = "清除JPG HDR小工具"
 # The installed app must be independent of the developer's Homebrew environment.
 RESOURCES = Path(__file__).resolve().parent
-BUNDLED = RESOURCES.name == "Resources" and RESOURCES.parent.name == "Contents"
-if BUNDLED:
+BUNDLED = os.name == "nt" or (RESOURCES.name == "Resources" and RESOURCES.parent.name == "Contents")
+if os.name == "nt":
+    EXIFTOOL = str(RESOURCES / "exiftool/exiftool.exe")
+elif BUNDLED:
     EXIFTOOL = str(RESOURCES / "exiftool/bin/exiftool")
 else:
     EXIFTOOL = next((path for path in (
@@ -30,11 +33,26 @@ READ_TAGS = [
 ]
 
 
+def exiftool(path, *options, binary=False):
+    if os.name == "nt":
+        # ExifTool's Windows launcher uses the system code page for argv. Give it
+        # the filename through a UTF-8 argument file on stdin, even for reads.
+        if any(c in str(path) for c in ("\r", "\n", "\0")):
+            raise ValueError("文件名含有不支持的字符")
+        result = subprocess.run(
+            [EXIFTOOL, "-config", "", "-charset", "filename=utf8", *options, "-@", "-"],
+            input=(str(path) + "\n").encode("utf-8"), capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if not binary:
+            result.stdout = result.stdout.decode("utf-8")
+        result.stderr = result.stderr.decode("utf-8", errors="replace")
+        return result
+    return subprocess.run([EXIFTOOL, *options, str(path)], capture_output=True, text=not binary)
+
+
 def metadata(path):
-    result = subprocess.run(
-        [EXIFTOOL, "-j", "-a", "-G1:4", "-n", *READ_TAGS, str(path)],
-        capture_output=True, text=True,
-    )
+    result = exiftool(path, "-j", "-a", "-G1:4", "-n", *READ_TAGS)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "无法读取图片")
     record = json.loads(result.stdout)[0]
@@ -126,18 +144,45 @@ def skip_reason(path, record):
 
 
 def clear_file(path, stat):
-    result = subprocess.run(
-        [EXIFTOOL, "-MPF:All=", "-Trailer:All=", "-XMP-hdrgm:All=",
-         "-XMP-GContainer:All=", "-XMP-HDRGainMap:All=",
-         "-overwrite_original_in_place", str(path)],
-        capture_output=True, text=True,
-    )
+    result = exiftool(path, "-MPF:All=", "-Trailer:All=", "-XMP-hdrgm:All=",
+                      "-XMP-GContainer:All=", "-XMP-HDRGainMap:All=", "-overwrite_original_in_place")
     if result.returncode or result.stderr.strip():
         raise RuntimeError(result.stderr.strip() or "ExifTool 写入失败")
     if values(metadata(path), "MPImageType"):
         raise RuntimeError("写入后仍检测到多图数据")
+    if os.name == "nt":
+        # ExifTool's Windows timestamp conversion rounds creation times.
+        restore_windows_creation_time(path, stat)
     # ExifTool's -P truncates sub-second timestamps on this Mac.
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+
+def restore_windows_creation_time(path, stat):
+    import msvcrt
+    from ctypes import wintypes
+    # Windows timestamps count 100 ns ticks from 1601 (UNIX time begins in 1970).
+    birth = getattr(stat, "st_birthtime_ns", stat.st_ctime_ns) // 100 + 116444736000000000
+    creation = wintypes.FILETIME(birth & 0xffffffff, birth >> 32)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    with path.open("r+b") as stream:
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
+        if not kernel.SetFileTime(handle, ctypes.byref(creation), None, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def copy_original(path, destination, stat):
+    if os.name == "nt":
+        # CopyFileW also copies NTFS alternate data streams and file attributes.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel.CopyFileW(str(path), str(destination), True):
+            raise ctypes.WinError(ctypes.get_last_error())
+        restore_windows_creation_time(destination, stat)
+    else:
+        # macOS cp -cp preserves Finder metadata and uses APFS clones when available.
+        result = subprocess.run(["/bin/cp", "-cp", str(path), str(destination)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "无法复制原图")
 
 
 def clear_with_backup(path, stat):
@@ -150,17 +195,21 @@ def clear_with_backup(path, stat):
         work = Path(scratch) / "work.jpg"
         original = Path(scratch) / "original"
         for destination in (work, original):
-            # macOS cp -cp preserves Finder metadata and uses APFS clones when available.
-            result = subprocess.run(["/bin/cp", "-cp", str(path), str(destination)],
-                                    capture_output=True, text=True)
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or "无法复制原图")
+            copy_original(path, destination, stat)
         clear_file(work, stat)
         current = path.lstat()
-        if (current.st_dev, current.st_ino, current.st_ctime_ns) != (
-                stat.st_dev, stat.st_ino, stat.st_ctime_ns):
+        if (current.st_dev, current.st_ino, current.st_ctime_ns, current.st_mtime_ns, current.st_size) != (
+                stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size):
             raise RuntimeError("处理期间原图已改变，已停止写入")
 
+        if os.name == "nt":
+            # Windows rename refuses to replace an existing backup. ReplaceFileW
+            # merges the original file's ACLs, creation time and named streams.
+            os.rename(original, backup)
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            if not kernel.ReplaceFileW(str(path), str(work), None, 0, None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return
         # Darwin RENAME_EXCL publishes the completed backup without overwriting a collision.
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.renamex_np(os.fsencode(original), os.fsencode(backup), 0x00000004) != 0:
@@ -169,6 +218,12 @@ def clear_with_backup(path, stat):
                 raise RuntimeError("同名备份已存在，原图未修改")
             raise OSError(code, os.strerror(code), str(backup))
         os.replace(work, path)
+
+
+def is_link(path):
+    if os.name == "nt":
+        return bool(path.lstat().st_file_attributes & stat_flags.FILE_ATTRIBUTE_REPARSE_POINT)
+    return path.is_symlink()
 
 
 def run(paths, backup=False):
@@ -181,8 +236,8 @@ def run(paths, backup=False):
     for raw_path in paths:
         path = Path(raw_path).absolute()
         try:
-            if path.is_symlink():
-                report["skipped"].append([str(path), "不处理符号链接"])
+            if is_link(path):
+                report["skipped"].append([str(path), "不处理链接或重解析点"])
             elif path.is_dir():
                 candidates.extend(sorted(
                     (child for child in path.iterdir()
@@ -196,11 +251,11 @@ def run(paths, backup=False):
     seen = set()
     for path in candidates:
         try:
-            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in (".jpg", ".jpeg"):
+            if is_link(path) or not path.is_file() or path.suffix.lower() not in (".jpg", ".jpeg"):
                 report["skipped"].append([str(path), "只处理 JPG/JPEG 普通文件"])
                 continue
             stat = path.stat()
-            identity = (stat.st_dev, stat.st_ino)
+            identity = (stat.st_dev, stat.st_ino) if stat.st_ino else os.path.normcase(str(path))
             if identity in seen:
                 continue
             seen.add(identity)
@@ -212,6 +267,8 @@ def run(paths, backup=False):
             if reason:
                 report["skipped"].append([str(path), reason])
                 continue
+            if os.name == "nt" and stat.st_file_attributes & stat_flags.FILE_ATTRIBUTE_READONLY:
+                raise PermissionError("图片为只读文件")
             if backup:
                 clear_with_backup(path, stat)
             else:
@@ -243,8 +300,25 @@ def notify(report):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backup", action="store_true", help="keep an original beside each edited JPEG")
+    parser.add_argument("--stdin-paths", action="store_true", help="read a UTF-8 JSON array of absolute paths")
     parser.add_argument("paths", nargs="*")
     options = parser.parse_args()
-    outcome = run(options.paths, backup=options.backup)
+    try:
+        paths = options.paths
+        if options.stdin_paths:
+            if paths:
+                raise ValueError("输入来源重复")
+            paths = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
+            if not isinstance(paths, list) or not all(
+                isinstance(p, str) and os.path.isabs(p) and "\x00" not in p for p in paths
+            ):
+                raise ValueError("菜单请求必须包含绝对文件路径")
+        outcome = run(paths, backup=options.backup)
+    except ValueError as error:
+        outcome = {"processed": [], "skipped": [], "failed": [["菜单请求", str(error)]]}
+    if os.name == "nt":
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(json.dumps(outcome, ensure_ascii=False))
+        raise SystemExit(1 if outcome["failed"] else 0)
     print(json.dumps(outcome, ensure_ascii=False, indent=2))
     notify(outcome)

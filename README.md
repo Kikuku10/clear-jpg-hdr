@@ -1,8 +1,16 @@
 # 清除JPG HDR小工具
 
-在 macOS Finder 中右键选中 JPG、JPEG 或文件夹，选择「清除 JPG HDR 增益图」，即可移除明确标记的 HDR 增益图。主图无需重新压缩。文件夹只处理当前层，多选也可以使用。
+在 macOS Finder 或 Windows 资源管理器中选中 JPG、JPEG 或文件夹，右键选择「清除 JPG HDR 增益图」，即可移除明确标记的 HDR 增益图。主图无需重新压缩。文件夹只处理当前层，也支持多选。
 
 ## 下载与安装
+
+### Windows
+
+运行 `ClearJPGHDR-1.3.0-windows-x64-setup.exe` 安装到当前账户。支持 Windows 10/11 x64 和可运行 x64 应用的 Windows 11 on Arm。Python、ExifTool 和 Perl 随安装包提供。从开始菜单打开「清除JPG HDR小工具」可以切换右键菜单、设置原图备份。卸载入口在 Windows「已安装的应用」中。
+
+Windows 10 的操作在右键菜单内。Windows 11 普通安装后，入口在 **右键 → 显示更多选项 → 清除 JPG HDR 增益图**。设置窗口会显示当前菜单位置。系统已启用开发者模式，或部署方已为随附的菜单身份包提供 Windows 信任的签名时，可注册 Windows 11 新版一级菜单。
+
+### macOS
 
 1. 在 [GitHub Releases](https://github.com/Kikuku10/clear-jpg-hdr/releases/latest) 下载适合自己 Mac 的 DMG。Apple 芯片选 `arm64`，Intel 选 `x86_64`。最低系统版本为 macOS 13。
 2. 打开 DMG，将「清除JPG HDR小工具」拖到旁边的「Applications」文件夹。Python、Perl 和 ExifTool 均随 App 安装。
@@ -16,7 +24,7 @@ v1.2.0 使用本地签名，未经 Apple 公证。首次启动若被 Gatekeeper 
 
 | 设置 | 默认值 | 作用 |
 | --- | --- | --- |
-| 显示「清除 JPG HDR 增益图」 | 开 | 在图片或文件夹的 Finder 一级右键菜单中显示此操作 |
+| 显示「清除 JPG HDR 增益图」 | 开 | 在图片或文件夹的右键菜单中显示此操作 |
 | 保留原图备份 | 关 | 开启后，只在即将处理照片时，在同一目录保存完整原图，如 `照片.jpg_original` |
 
 备份关闭时直接修改原文件。备份开启时，如果已有同名备份或备份失败，会保留原图并报告失败。需要恢复时，可将备份复制到其他目录，再删去副本文件名末尾的 `_original`。
@@ -24,6 +32,25 @@ v1.2.0 使用本地签名，未经 Apple 公证。首次启动若被 Gatekeeper 
 处理成功和跳过均静默，只有失败会提示。普通 JPEG、主图自身为 HDR、未明确标记增益图和包含其他附图的文件会跳过。当前支持 MPF 中恰有一张主图和一张明确标记的 Gain Map 的 JPEG。
 
 ## 从源码构建
+
+### Windows
+
+在 Windows 上准备 Visual Studio C++ 桌面生成工具（x64 和 ARM64 目标）、Windows SDK、.NET Framework 4.x 编译器、Python 3 和 NSIS 3。将 `makensis` 加入 PATH，并在仓库根目录的 PowerShell 执行：
+
+```powershell
+.\windows\build.ps1 -OutputDirectory build-native
+py -3 packaging/windows/build_windows.py --native-dir build-native --output build-windows-x64
+```
+
+生成的安装程序在 `build-windows-x64/`。Windows 版的照片处理测试可针对已安装的程序执行：
+
+```powershell
+$app = Join-Path $env:LOCALAPPDATA 'Programs\ClearJPGHDR'
+$env:CLEAR_HDR_TEST_ENGINE = Join-Path $app 'clear_hdr.py'
+& "$app\runtime\python.exe" -I -B -X utf8 tests/test_clear_hdr.py -v
+```
+
+### macOS
 
 构建机需要 macOS、Xcode 或 Command Line Tools 和网络连接。打包脚本下载固定版本的工具、校验 SHA-256，并编译当前架构的 Perl。首次构建需要几分钟。
 

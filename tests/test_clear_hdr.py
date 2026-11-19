@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,8 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("clear_hdr", ROOT / "clear_hdr.py")
+ENGINE = Path(os.environ.get("CLEAR_HDR_TEST_ENGINE", ROOT / "clear_hdr.py"))
+SPEC = importlib.util.spec_from_file_location("clear_hdr", ENGINE)
 clear_hdr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(clear_hdr)
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -66,17 +68,23 @@ def image_payload(data):
 
 
 def binary_metadata(path, tag):
-    return subprocess.run(
-        [clear_hdr.EXIFTOOL, "-b", "-" + tag, str(path)],
-        capture_output=True, check=True,
-    ).stdout
+    result = clear_hdr.exiftool(path, "-b", "-" + tag, binary=True)
+    result.check_returncode()
+    return result.stdout
 
 
 def set_xattr(path, name, data):
+    if os.name == "nt":
+        Path(str(path) + ":" + name.replace(":", "_")).write_bytes(data)
+        return
     subprocess.run(["/usr/bin/xattr", "-wx", name, data.hex(), str(path)], check=True)
 
 
 def xattrs(path):
+    if os.name == "nt":
+        return {name: stream.read_bytes()
+                for name in ("com.apple.metadata:_kMDItemUserTags", "com.mimi.clear-hdr-test")
+                for stream in (Path(str(path) + ":" + name.replace(":", "_")),) if stream.exists()}
     names = subprocess.run(
         ["/usr/bin/xattr", str(path)], capture_output=True, text=True, check=True,
     ).stdout.splitlines()
@@ -88,6 +96,14 @@ def xattrs(path):
 
 class ClearHDRTests(unittest.TestCase):
     def test_only_failures_show_a_prompt(self):
+        if os.name == "nt":
+            path = self.directory / "损坏的照片.jpg"
+            path.write_bytes(b"\xff\xd8broken")
+            result = subprocess.run([sys.executable, str(ENGINE), "--", str(path)],
+                                    capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(json.loads(result.stdout)["failed"][0][0], str(path))
+            return
         for report in (
             {"processed": ["/tmp/photo.jpg"], "skipped": [], "failed": []},
             {"processed": [], "skipped": [["/tmp/photo.jpg", "普通图片"]], "failed": []},
@@ -148,6 +164,8 @@ class ClearHDRTests(unittest.TestCase):
                 self.assertEqual(binary_metadata(path, "ICC_Profile"), before_icc)
                 self.assertEqual(xattrs(path), before_xattrs)
                 self.assertEqual(path.stat().st_birthtime, before_stat.st_birthtime)
+                if os.name == "nt":
+                    self.assertEqual(path.stat().st_birthtime_ns, before_stat.st_birthtime_ns)
                 self.assertEqual(path.stat().st_mtime_ns, before_stat.st_mtime_ns)
                 self.assertFalse(Path(str(path) + "_original").exists())
                 self.assertEqual(clear_hdr.values(clear_hdr.metadata(path), "MPImageType"), [])
@@ -156,15 +174,18 @@ class ClearHDRTests(unittest.TestCase):
                 self.assertEqual(clear_hdr.run([str(path)])["processed"], [])
 
     def test_cli_backup_keeps_original_and_skips_it_on_rerun(self):
-        path = self.fixture("照片 1.jpg")
+        path = self.fixture("我的 '照片' 1.jpg")
         unchanged = self.fixture("普通.jpg", image_type=None)
         original_bytes = path.read_bytes()
         tags = plistlib.dumps(["HDR\n6"], fmt=plistlib.FMT_BINARY)
         set_xattr(path, "com.apple.metadata:_kMDItemUserTags", tags)
         original_time = path.stat().st_mtime_ns
+        original_birth = path.stat().st_birthtime
         backup_path = Path(str(path) + "_original")
-        args = [sys.executable, str(ROOT / "clear_hdr.py"), "--backup", "--", str(self.directory)]
-        first = json.loads(subprocess.run(args, check=True, capture_output=True).stdout)
+        args = [sys.executable, str(ENGINE), "--backup", "--", str(self.directory)]
+        selection = json.dumps([str(path), str(unchanged)], ensure_ascii=False).encode("utf-8")
+        first = json.loads(subprocess.run([sys.executable, str(ENGINE), "--backup", "--stdin-paths"],
+                                          input=selection, check=True, capture_output=True).stdout)
         self.assertEqual(first["failed"], [])
         self.assertEqual(first["processed"], [str(path)])
         self.assertEqual(backup_path.read_bytes(), original_bytes)
@@ -173,6 +194,8 @@ class ClearHDRTests(unittest.TestCase):
         for candidate in (path, backup_path):
             self.assertEqual(candidate.stat().st_mtime_ns, original_time)
             self.assertEqual(xattrs(candidate)["com.apple.metadata:_kMDItemUserTags"], tags)
+            if os.name == "nt":
+                self.assertEqual(candidate.stat().st_birthtime, original_birth)
         second = json.loads(subprocess.run(args, check=True, capture_output=True).stdout)
         self.assertEqual(second["failed"], [])
         self.assertEqual(second["processed"], [])
@@ -199,13 +222,22 @@ class ClearHDRTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original_bytes)
         self.assertEqual(list(path.parent.iterdir()), [path])
 
+        if os.name == "nt":
+            # A concurrent writer may create the backup after the initial check.
+            real_rename = os.rename
+            def collision(source, destination):
+                Path(destination).write_bytes(b"concurrent backup")
+                return real_rename(source, destination)
+            with mock.patch.object(os, "rename", side_effect=collision):
+                report = clear_hdr.run([str(path)], backup=True)
+            self.assertEqual(len(report["failed"]), 1)
+            self.assertEqual(backup_path.read_bytes(), b"concurrent backup")
+            self.assertEqual(path.read_bytes(), original_bytes)
+
     def test_ordinary_undefined_preview_and_extra_trailer_are_unchanged(self):
         ordinary = self.fixture("ordinary.jpg")
         ordinary.write_bytes(ordinary.read_bytes()[:33487])
-        subprocess.run(
-            [clear_hdr.EXIFTOOL, "-MPF:All=", "-XMP:All=", "-overwrite_original", str(ordinary)],
-            capture_output=True, check=True,
-        )
+        clear_hdr.exiftool(ordinary, "-MPF:All=", "-XMP:All=", "-overwrite_original").check_returncode()
         undefined = self.fixture("undefined.jpg", image_type=None)
         preview = self.fixture("preview.jpg", image_type=0x010001)
         trailer = self.fixture("extra-trailer.jpg")
@@ -247,19 +279,26 @@ class ClearHDRTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), data)
 
     def test_folder_is_shallow_deduplicated_and_paths_and_links_are_safe(self):
-        selected = self.fixture("选择 中文 空格 '单引号' \"双引号\"\n换行.JPEG")
+        selected = self.fixture("选择 中文 空格 '单引号' &.JPEG" if os.name == "nt"
+                                else "选择 中文 空格 '单引号' \"双引号\"\n换行.JPEG")
         nested = self.fixture("子目录/nested.jpg")
         hard_target = self.fixture("子目录/hard-target.jpg")
         hard_link = self.directory / "hard-link.jpg"
         os.link(hard_target, hard_link)
-        symlink = self.directory / "symbolic-link.jpg"
-        symlink.symlink_to(nested)
+        if os.name == "nt":
+            # Directory junctions need no Developer Mode or administrator privilege.
+            symlink = self.directory / "junction.jpg"
+            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/j", str(symlink),
+                            str(nested.parent)], capture_output=True, check=True)
+        else:
+            symlink = self.directory / "symbolic-link.jpg"
+            symlink.symlink_to(nested)
         text_file = self.directory / "text.png"
         text_file.write_bytes(b"not a JPEG")
-        protected = [nested, hard_target, hard_link, symlink, text_file]
+        protected = [nested, hard_target, hard_link, text_file]
         before = {path: path.read_bytes() for path in protected}
 
-        report = clear_hdr.run([str(self.directory), str(selected), str(text_file)])
+        report = clear_hdr.run([str(self.directory), str(selected), str(text_file), str(symlink)])
 
         self.assertEqual(report["processed"], [str(selected)])
         self.assertEqual(report["failed"], [])
@@ -284,18 +323,29 @@ class ClearHDRTests(unittest.TestCase):
 
         failed_write = self.fixture("failed-write.jpg")
         before = failed_write.read_bytes()
-        real_run = subprocess.run
+        real_run = clear_hdr.exiftool
 
-        def write_error(arguments, **kwargs):
-            if "-MPF:All=" in arguments:
-                return subprocess.CompletedProcess(arguments, 1, "", "write denied")
-            return real_run(arguments, **kwargs)
+        def write_error(path, *options):
+            if "-MPF:All=" in options:
+                return subprocess.CompletedProcess(options, 1, "", "write denied")
+            return real_run(path, *options)
 
-        with mock.patch.object(clear_hdr.subprocess, "run", side_effect=write_error):
+        with mock.patch.object(clear_hdr, "exiftool", side_effect=write_error):
             report = clear_hdr.run([str(failed_write)])
         self.assertEqual(report["processed"], [])
         self.assertEqual(report["failed"], [[str(failed_write), "write denied"]])
         self.assertEqual(failed_write.read_bytes(), before)
+
+        if os.name == "nt":
+            failed_write.chmod(stat.S_IREAD)
+            try:
+                for backup in (False, True):
+                    report = clear_hdr.run([str(failed_write)], backup=backup)
+                    self.assertEqual(report["failed"], [[str(failed_write), "图片为只读文件"]])
+                    self.assertEqual(failed_write.read_bytes(), before)
+                    self.assertFalse(Path(str(failed_write) + "_original").exists())
+            finally:
+                failed_write.chmod(stat.S_IREAD | stat.S_IWRITE)
 
 
 if __name__ == "__main__":
