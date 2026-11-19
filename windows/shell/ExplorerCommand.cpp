@@ -8,6 +8,7 @@
 #include <wrl.h>
 #include <string>
 #include <new>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 using Microsoft::WRL::RuntimeClass;
@@ -54,6 +55,36 @@ static HRESULT launch(const std::wstring& exe, std::wstring& args) {
     return S_OK;
 }
 
+// One Explorer invocation must produce a single result, including selections
+// that exceed CreateProcessW's 32,767-character command line limit.
+static HRESULT launchSelection(const std::wstring& exe, const std::vector<std::wstring>& paths) {
+    wchar_t temp[MAX_PATH + 1], id[39];
+    DWORD n = GetTempPathW(ARRAYSIZE(temp), temp);
+    if (!n) return HRESULT_FROM_WIN32(GetLastError());
+    if (n >= ARRAYSIZE(temp)) return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    GUID guid;
+    HRESULT hr = CoCreateGuid(&guid);
+    if (FAILED(hr)) return hr;
+    if (!StringFromGUID2(guid, id, ARRAYSIZE(id))) return E_FAIL;
+    std::wstring request = std::wstring(temp) + L"ClearJPGHDR-" + id + L".selection";
+    std::wstring args = L"\"" + exe + L"\" --selection " + id;
+    HANDLE file = CreateFileW(request.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    for (const auto& path : paths) {
+        DWORD size = static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t)), written;
+        if (!WriteFile(file, path.c_str(), size, &written, nullptr)) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            break;
+        }
+        if (written != size) { hr = STG_E_WRITEFAULT; break; }
+    }
+    CloseHandle(file);
+    if (SUCCEEDED(hr)) hr = launch(exe, args);
+    if (FAILED(hr)) DeleteFileW(request.c_str());
+    return hr;
+}
+
 class Command final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IExplorerCommand, IObjectWithSite> {
     ComPtr<IUnknown> site;
     HRESULT background(ComPtr<IShellItem>& item) {
@@ -81,12 +112,13 @@ class Command final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IExplor
         DWORD count = 0;
         HRESULT hr = items ? items->GetCount(&count) : S_OK;
         if (FAILED(hr)) return hr;
-        std::wstring exe, prefix, args;
+        std::wstring exe, args;
+        std::vector<std::wstring> paths;
+        bool overLimit = false;
         if (perform) {
             exe = hostPath();
             if (exe.empty()) return E_FAIL;
-            prefix = L"\"" + exe + L"\" --process";
-            args = prefix;
+            args = L"\"" + exe + L"\" --process";
         }
         for (DWORD i = 0; i < (count ? count : 1); ++i) {
             ComPtr<IShellItem> item;
@@ -96,16 +128,15 @@ class Command final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IExplor
             if (!eligible(item.Get(), path)) continue;
             found = true;
             if (!perform) return S_OK;
-            auto arg = argument(path);
-            if (prefix.size() + arg.size() > 32766) return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
-            if (args.size() + arg.size() > 32766) {
-                hr = launch(exe, args);
-                if (FAILED(hr)) return hr;
-                args = prefix;
+            if (!overLimit) {
+                auto arg = argument(path);
+                if (args.size() + arg.size() > 32766) overLimit = true;
+                else args += arg;
             }
-            args += arg;
+            paths.push_back(std::move(path));
         }
-        return perform && found ? launch(exe, args) : S_OK;
+        if (!perform || !found) return S_OK;
+        return overLimit ? launchSelection(exe, paths) : launch(exe, args);
     }
 public:
     Command() { InterlockedIncrement(&objects); }

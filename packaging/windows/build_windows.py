@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PYTHON_URL = "https://www.python.org/ftp/python/3.13.17/python-3.13.17-embed-amd64.zip"
 PYTHON_SHA = "9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38"
 EXIF_URL = "https://downloads.sourceforge.net/project/exiftool/exiftool-13.55_64.zip"

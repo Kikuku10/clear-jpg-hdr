@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,51 @@ def binary_metadata(path, tag):
     return result.stdout
 
 
+def preview_fixture(endian="little", extra_xmp=b"", gap=b"\0" * 7, gain_is_hdr=b"False"):
+    """Build an explicitly typed three-JPEG MPF using only public fixture pixels."""
+    source = FIXTURES / IMAGES[2][0]
+    pixels = image_payload(source.read_bytes())
+
+    def app(marker, payload):
+        return bytes([0xff, marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+    def xmp(attributes):
+        return app(0xe1, b'http://ns.adobe.com/xap/1.0/\0'
+                   b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+                   b'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                   b'<rdf:Description xmlns:g="http://ns.adobe.com/hdr-gain-map/1.0/" '
+                   b'g:Version="1.0" ' + attributes + b'/></rdf:RDF></x:xmpmeta>')
+
+    exif = app(0xe1, b"Exif\0\0" + binary_metadata(source, "EXIF"))
+    icc = app(0xe2, b"ICC_PROFILE\0\1\1" + binary_metadata(source, "ICC_Profile"))
+    iso = app(0xe2, b"urn:iso:std:iso:ts:21496:-1\0" + bytes.fromhex("0000000040")
+              + struct.pack(">14I", 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1))
+    preview = pixels[:2] + exif + pixels[2:]
+    gain = pixels[:2] + iso + xmp(b'g:BaseRenditionIsHDR="' + gain_is_hdr + b'"') + pixels[2:]
+    before = pixels[:2] + exif
+    after = icc + pixels[2:]
+    if endian == "little":
+        before += xmp(extra_xmp)
+        after = iso + after
+    else:
+        after = xmp(extra_xmp) + iso + after
+
+    # CIPA MP Index IFD: three standard fields, no next IFD; entries at TIFF + 50.
+    order = "<" if endian == "little" else ">"
+    header = (b"II" if endian == "little" else b"MM") + struct.pack(order + "HIH", 42, 8, 3)
+    header += struct.pack(order + "HHI4s", 0xb000, 7, 4, b"0100")
+    header += struct.pack(order + "HHII", 0xb001, 4, 1, 3)
+    header += struct.pack(order + "HHIII", 0xb002, 7, 48, 50, 0)
+    origin = len(before) + 8
+    primary_size = origin + len(header) + 48 + len(after)
+    preview_offset = primary_size + 2 - origin
+    entries = [(0x30000, primary_size, 0), (0x10002, len(preview), preview_offset),
+               (0x50000, len(gain), preview_offset + len(preview) + len(gap))]
+    table = b"".join(struct.pack(order + "IIIHH", *entry, 0, 0) for entry in entries)
+    main = before + app(0xe2, b"MPF\0" + header + table) + after
+    return main + b"\0\0" + preview + gap + gain, preview
+
+
 def set_xattr(path, name, data):
     if os.name == "nt":
         Path(str(path) + ":" + name.replace(":", "_")).write_bytes(data)
@@ -95,34 +141,34 @@ def xattrs(path):
 
 
 class ClearHDRTests(unittest.TestCase):
-    def test_only_failures_show_a_prompt(self):
-        if os.name == "nt":
-            path = self.directory / "损坏的照片.jpg"
-            path.write_bytes(b"\xff\xd8broken")
-            result = subprocess.run([sys.executable, str(ENGINE), "--", str(path)],
-                                    capture_output=True, timeout=60)
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(json.loads(result.stdout)["failed"][0][0], str(path))
-            return
-        for report in (
-            {"processed": ["/tmp/photo.jpg"], "skipped": [], "failed": []},
-            {"processed": [], "skipped": [["/tmp/photo.jpg", "普通图片"]], "failed": []},
-            {"processed": [], "skipped": [], "failed": []},
+    def test_menu_result_includes_counts_and_reasons(self):
+        good = self.fixture("一.jpg")
+        skipped = self.directory / "普通.jpg"
+        # Use a real SDR copy with the old MPF index removed.
+        self.assertEqual(clear_hdr.run([str(good)])["processed"], [str(good)])
+        skipped.write_bytes(good.read_bytes())
+        good = self.fixture("二.jpg")
+        bad = self.directory / "损坏.jpg"
+        bad.write_bytes(b"\xff\xd8broken")
+        for paths, code, counts in (
+            ([good], 0, "成功 1 个，跳过 0 个，失败 0 个"),
+            ([good, skipped], 0, "成功 0 个，跳过 2 个，失败 0 个"),
+            ([self.fixture("三.jpg"), skipped, bad], 1, "成功 1 个，跳过 1 个，失败 1 个"),
+            ([], 0, "成功 0 个，跳过 0 个，失败 0 个"),
         ):
-            with self.subTest(report=report), mock.patch.object(clear_hdr.subprocess, "run") as execute:
-                clear_hdr.notify(report)
-                execute.assert_not_called()
-        report = {"processed": ["/tmp/ok.jpg"], "skipped": [],
-                  "failed": [["/tmp/bad.jpg", "写入失败"]]}
-        with mock.patch.object(clear_hdr.subprocess, "run", return_value=
-                               subprocess.CompletedProcess([], 0, "", "")) as execute:
-            clear_hdr.notify(report)
-            execute.assert_called_once()
-            command = execute.call_args.args[0]
-            self.assertEqual(command[0], "/usr/bin/osascript")
-            self.assertIn("display dialog", command[2])
-            self.assertNotIn("display notification", command[2])
-            self.assertIn("bad.jpg：写入失败", command[3])
+            with self.subTest(counts=counts):
+                result = subprocess.run([sys.executable, str(ENGINE), "--stdin-paths"],
+                                        input=json.dumps(list(map(str, paths))).encode(),
+                                        capture_output=True, timeout=60)
+                self.assertEqual(result.returncode, code)
+                report = json.loads(result.stdout)
+                self.assertIn(counts, report["message"])
+                self.assertTrue(report["title"])
+                if report["skipped"]:
+                    self.assertIn(report["skipped"][0][1], report["message"])
+                if code:
+                    self.assertIn(bad.name, report["message"])
+                    self.assertIn(report["failed"][0][1], report["message"])
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="clear-hdr-test-")
@@ -346,6 +392,63 @@ class ClearHDRTests(unittest.TestCase):
                     self.assertFalse(Path(str(failed_write) + "_original").exists())
             finally:
                 failed_write.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+    def test_three_images_preserve_primary_preview_and_file_metadata(self):
+        for order, backup in (("little", False), ("big", True)):
+            with self.subTest(order=order):
+                original, preview = preview_fixture(order)
+                path = self.directory / (order + ".jpg")
+                path.write_bytes(original)
+                set_xattr(path, "com.mimi.clear-hdr-test", b"retain")
+                os.utime(path, ns=(1690000000123456789,) * 2)
+                before = path.stat()
+                exif = binary_metadata(path, "EXIF")
+                icc = binary_metadata(path, "ICC_Profile")
+                self.assertTrue(exif and icc)
+
+                self.assertEqual(clear_hdr.run([str(path)], backup=backup),
+                                 {"processed": [str(path)], "skipped": [], "failed": []})
+                result = path.read_bytes()
+                record = clear_hdr.metadata(path)
+                end = len(result) - len(preview)
+                self.assertEqual(result[end:], preview)
+                self.assertEqual(result[end-2:end], b"\xff\xd9")
+                self.assertEqual(clear_hdr.values(record, "MPImageType"), [0x30000, 0x10002])
+                self.assertEqual(clear_hdr.values(record, "MPImageStart"), [0, end])
+                self.assertEqual(clear_hdr.values(record, "MPImageLength"), [end, len(preview)])
+                self.assertEqual(image_payload(result), image_payload(original))
+                self.assertNotIn(b"hdr-gain-map", result)
+                self.assertNotIn(b"21496", result)
+                self.assertEqual(binary_metadata(path, "EXIF"), exif)
+                self.assertEqual(binary_metadata(path, "ICC_Profile"), icc)
+                self.assertEqual(xattrs(path)["com.mimi.clear-hdr-test"], b"retain")
+                self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(path.stat().st_birthtime, before.st_birthtime)
+                saved = Path(str(path) + "_original")
+                self.assertEqual(saved.exists(), backup)
+                if backup:
+                    self.assertEqual(saved.read_bytes(), original)
+                self.assertEqual(len(clear_hdr.run([str(path)])["skipped"]), 1)
+                self.assertEqual(path.read_bytes(), result)
+
+    def test_three_images_skip_ambiguous_content_without_writes(self):
+        for label, options, trailer in (
+            ("caption", {"extra_xmp": b'xmlns:d="http://purl.org/dc/elements/1.1/" d:title="keep"'}, b""),
+            ("unknown gap", {"gap": b"KEEP"}, b""),
+            ("trailer", {}, b"unindexed data"),
+            ("HDR base", {"gain_is_hdr": b"True"}, b""),
+        ):
+            with self.subTest(label=label):
+                photo, _ = preview_fixture(**options)
+                original = photo + trailer
+                path = self.directory / (label + ".jpg")
+                path.write_bytes(original)
+                report = clear_hdr.run([str(path)], backup=True)
+                self.assertEqual(report["failed"], [])
+                self.assertEqual([x[0] for x in report["skipped"]], [str(path)])
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse(Path(str(path) + "_original").exists())
 
 
 if __name__ == "__main__":

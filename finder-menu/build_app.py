@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 APP_NAME = "清除JPG HDR小工具"
 APP_ID = "local.mimi.ClearJPGHDR"
 EXT_ID = APP_ID + ".FinderMenu"
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 
 
 def run(*arguments):
@@ -61,7 +61,7 @@ def build(output):
         "CFBundleDevelopmentRegion": "zh_CN",
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleShortVersionString": VERSION,
-        "CFBundleVersion": "5",
+        "CFBundleVersion": "6",
         "CFBundleSupportedPlatforms": ["MacOSX"],
         "LSMinimumSystemVersion": "13.0",
         "LSUIElement": True,

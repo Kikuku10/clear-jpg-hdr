@@ -46,16 +46,25 @@ namespace ClearJPGHDR
                     Application.Run(new SettingsWindow());
                     return 0;
                 }
-                if (args[0] != "--process" || args.Length < 2)
+                string[] paths;
+                if (args[0] == "--process" && args.Length >= 2)
+                    paths = args.Skip(1).ToArray();
+                else if (args[0] == "--selection" && args.Length == 2)
+                    paths = ReadSelection(args[1]);
+                else
                     throw new ArgumentException("请选择要处理的 JPG 图片或文件夹。");
                 if (!ReadOption("MenuEnabled", true)) return 0;
+                Report report;
                 using (Mutex mutex = new Mutex(false, @"Local\ClearJPGHDR.PhotoWorker"))
                 {
                     try { mutex.WaitOne(); } catch (AbandonedMutexException) { }
-                    try { ProcessPhotos(args.Skip(1).ToArray()); }
+                    try { report = ProcessPhotos(paths); }
                     finally { mutex.ReleaseMutex(); }
                 }
-                return 0;
+                bool failed = report.failed.Length != 0;
+                MessageBox.Show(report.message, report.title, MessageBoxButtons.OK,
+                    failed ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                return failed ? 1 : 0;
             }
             catch (Exception e)
             {
@@ -65,12 +74,24 @@ namespace ClearJPGHDR
             }
         }
 
+        private static string[] ReadSelection(string request)
+        {
+            Guid id = Guid.ParseExact(request, "B");
+            string path = Path.Combine(Path.GetTempPath(), "ClearJPGHDR-" + id.ToString("B") + ".selection");
+            using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None,
+                                             4096, FileOptions.DeleteOnClose))
+            using (var reader = new StreamReader(file, Encoding.Unicode))
+                return reader.ReadToEnd().Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
         private sealed class Report
         {
+            public string title { get; set; }
+            public string message { get; set; }
             public string[][] failed { get; set; }
         }
 
-        private static void ProcessPhotos(string[] paths)
+        private static Report ProcessPhotos(string[] paths)
         {
             string root = AppDomain.CurrentDomain.BaseDirectory;
             var start = new ProcessStartInfo(Path.Combine(root, @"runtime\python.exe"));
@@ -95,11 +116,12 @@ namespace ClearJPGHDR
                 if (String.IsNullOrWhiteSpace(output.Result))
                     throw new IOException(String.IsNullOrWhiteSpace(error.Result) ? "照片处理程序未返回结果。" : error.Result.Trim());
                 var report = json.Deserialize<Report>(output.Result);
-                if (report == null || report.failed == null) throw new IOException("无法读取照片处理结果。");
-                if (report.failed.Length != 0)
-                    throw new IOException("处理失败 " + report.failed.Length + " 项。\n\n" +
-                        String.Join("\n", report.failed.Take(5).Select(item => Path.GetFileName(item[0]) + "：" + item[1])));
-                if (process.ExitCode != 0) throw new IOException("照片处理程序异常退出。\n" + error.Result.Trim());
+                if (report == null || report.failed == null || String.IsNullOrEmpty(report.title)
+                    || String.IsNullOrEmpty(report.message))
+                    throw new IOException("无法读取照片处理结果。");
+                if (process.ExitCode != (report.failed.Length == 0 ? 0 : 1))
+                    throw new IOException("照片处理程序异常退出。\n" + error.Result.Trim());
+                return report;
             }
         }
     }

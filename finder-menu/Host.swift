@@ -32,14 +32,24 @@ private struct Preferences: Codable {
     }
 }
 
-private func showError(_ title: String, _ text: String) {
+private func showAlert(_ title: String, _ text: String, style: NSAlert.Style = .warning) {
     let alert = NSAlert()
     alert.messageText = title
     alert.informativeText = text
-    alert.alertStyle = .warning
+    alert.alertStyle = style
     alert.addButton(withTitle: "好")
     NSApp.activate(ignoringOtherApps: true)
     alert.runModal()
+}
+
+private struct ProcessingResult: Decodable {
+    let title: String
+    let message: String
+    let failed: [[String]]
+
+    static func error(_ error: Error) -> Self {
+        Self(title: "清除失败", message: error.localizedDescription, failed: [[error.localizedDescription]])
+    }
 }
 
 private struct SettingsPanel: View {
@@ -53,7 +63,7 @@ private struct SettingsPanel: View {
             do {
                 try updated.save()
                 preferences = updated
-            } catch { showError("无法保存设置", error.localizedDescription) }
+            } catch { showAlert("无法保存设置", error.localizedDescription) }
         })
     }
 
@@ -94,7 +104,7 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         do { try prepareRequests() }
         catch {
-            showError("无法创建菜单请求目录", error.localizedDescription)
+            showAlert("无法创建菜单请求目录", error.localizedDescription)
             NSApp.terminate(nil)
             return
         }
@@ -103,12 +113,12 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            var errors: [String] = []
-            do { errors = try self.processRequests() }
-            catch { errors = [error.localizedDescription] }
+            let results: [ProcessingResult]
+            do { results = try self.processRequests() }
+            catch { results = [.error(error)] }
             DispatchQueue.main.async {
-                if !errors.isEmpty {
-                    showError("清除 JPG HDR 增益图失败", errors.prefix(5).joined(separator: "\n"))
+                for result in results {
+                    showAlert(result.title, result.message, style: result.failed.isEmpty ? .informational : .warning)
                 }
                 if self.settingsWindow == nil { NSApp.terminate(nil) }
             }
@@ -145,7 +155,7 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
                 appItem.submenu = appMenu
                 NSApp.mainMenu = menu
             } catch {
-                showError("无法读取设置", error.localizedDescription)
+                showAlert("无法读取设置", error.localizedDescription)
                 NSApp.terminate(nil)
                 return
             }
@@ -154,7 +164,7 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
-    private func processRequests() throws -> [String] {
+    private func processRequests() throws -> [ProcessingResult] {
         let files = FileManager.default
         let lock = open(requests.appendingPathComponent(".worker.lock").path, O_CREAT | O_RDWR, 0o600)
         guard lock >= 0 else { throw failure("无法打开菜单请求目录。") }
@@ -164,7 +174,7 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
         let pending = try files.contentsOfDirectory(at: requests,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             .filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        var errors: [String] = []
+        var results: [ProcessingResult] = []
         for request in pending {
             do {
                 let attributes = try request.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
@@ -178,13 +188,13 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
                       !paths.isEmpty, paths.allSatisfy({ $0.hasPrefix("/") && !$0.contains("\0") }) else {
                     throw failure("菜单请求格式无效。")
                 }
-                try process(paths, backup: Preferences.load().backupEnabled)
-            } catch { errors.append(error.localizedDescription) }
+                results.append(try process(claimed, backup: Preferences.load().backupEnabled))
+            } catch { results.append(.error(error)) }
         }
-        return errors
+        return results
     }
 
-    private func process(_ paths: [String], backup: Bool) throws {
+    private func process(_ request: URL, backup: Bool) throws -> ProcessingResult {
         let hostURL = Bundle.main.bundleURL.deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
         guard let script = Bundle(url: hostURL)?.url(forResource: "clear_hdr", withExtension: "py") else {
@@ -196,16 +206,23 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
             throw failure("App 内的 Python 不完整，请重新安装。")
         }
         process.executableURL = python
-        process.arguments = ["-I", "-B", script.path] + (backup ? ["--backup"] : []) + ["--"] + paths
+        let input = try FileHandle(forReadingFrom: request)
+        defer { try? input.close() }
+        process.standardInput = input
+        process.arguments = ["-I", "-B", script.path, "--stdin-paths"] + (backup ? ["--backup"] : [])
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
         try process.run()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            throw failure(String(data: data, encoding: .utf8) ?? "清除程序运行失败。")
+        if process.terminationReason == .exit,
+           let result = try? JSONDecoder().decode(ProcessingResult.self, from: data),
+           process.terminationStatus == (result.failed.isEmpty ? 0 : 1) {
+            return result
         }
+        let detail = String(decoding: data.prefix(1500), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        throw failure(detail.isEmpty ? "清除程序未返回结果（退出码 \(process.terminationStatus)）。" : detail)
     }
 
     private func failure(_ message: String) -> NSError {

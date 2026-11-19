@@ -2,6 +2,7 @@
 """Remove explicitly identified JPEG gain maps from selected images and folders."""
 
 import argparse
+from collections import Counter
 import ctypes
 import errno
 import json
@@ -9,12 +10,13 @@ import os
 from pathlib import Path
 import re
 import stat as stat_flags
+import struct
 import subprocess
 import sys
 import tempfile
+from xml.etree import ElementTree
 
 
-TITLE = "清除JPG HDR小工具"
 # The installed app must be independent of the developer's Homebrew environment.
 RESOURCES = Path(__file__).resolve().parent
 BUNDLED = os.name == "nt" or (RESOURCES.name == "Resources" and RESOURCES.parent.name == "Contents")
@@ -116,7 +118,7 @@ def skip_reason(path, record):
         group, tag = parts[0], parts[-1]
         if re.fullmatch(r"MPImage[1-9][0-9]*", group):
             images.setdefault(group, {})[tag] = value
-    # shortcut: accept only an explicit primary + gain-map pair; other HDR formats need samples.
+    # The separate preview-preserving path handles supported three-image files.
     if (values(record, "NumberOfImages") != [2]
             or set(images) != {"MPImage1", "MPImage2"}
             or images["MPImage1"].get("MPImageType") != 0x30000
@@ -141,6 +143,141 @@ def skip_reason(path, record):
             or any(data[primary_end:start]) or jpeg_end(data[start:]) != length):
         return "增益图边界不明确"
     return None
+
+
+XMP_ID = b"http://ns.adobe.com/xap/1.0/\0"
+ISO_GAIN_ID = b"urn:iso:std:iso:ts:21496:-1\0"
+HDRGM = "{http://ns.adobe.com/hdr-gain-map/1.0/}"
+RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+XMP = "{adobe:ns:meta/}"
+
+
+class UnsupportedLayout(ValueError):
+    pass
+
+
+def check_layout(condition, reason="三图索引或增益图边界不明确"):
+    if not condition:
+        raise UnsupportedLayout(reason)
+
+
+def gain_segments(data):
+    """Find complete metadata segments before the first scan of one bounded JPEG."""
+    sections = {}
+    pos = 2
+    while pos < len(data):
+        check_layout(data[pos] == 0xff and pos + 4 <= len(data))
+        marker = data[pos + 1]
+        if marker == 0xda:
+            # A second scan can carry its own metadata. Leave unfamiliar files
+            # untouched if a declaration lies beyond the headers we can edit.
+            for signature in (XMP_ID, ISO_GAIN_ID, b"MPF\0", b"http://ns.adobe.com/xmp/extension/\0"):
+                check_layout(data.find(signature, pos) == -1)
+            break
+        end = pos + 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
+        check_layout(pos + 4 <= end <= len(data))
+        payload = data[pos + 4:end]
+        for kind, code, prefix in (("xmp", 0xe1, XMP_ID), ("iso", 0xe2, ISO_GAIN_ID),
+                                   ("mpf", 0xe2, b"MPF\0")):
+            if marker == code and payload.startswith(prefix):
+                check_layout(kind not in sections)
+                sections[kind] = (pos, end, payload[len(prefix):])
+        check_layout(not payload.startswith(b"http://ns.adobe.com/xmp/extension/\0"))
+        pos = end
+    check_layout(pos < len(data))
+    return sections
+
+
+def check_gain_declarations(sections, primary):
+    check_layout("xmp" in sections and "iso" in sections)
+    # Version 0, single-channel ISO metadata, using the base colour space and
+    # zero base headroom. Keep unfamiliar versions and HDR base renditions.
+    iso = sections["iso"][2]
+    check_layout(len(iso) == 61 and iso[:13] == bytes.fromhex("00000000400000000000000001"),
+                 "主图 HDR 状态或增益图声明不受支持")
+    raw = sections["xmp"][2]
+    check_layout(b"<!" not in raw)
+    try:
+        root = ElementTree.fromstring(raw)
+    except ElementTree.ParseError as error:
+        raise UnsupportedLayout("无法识别增益图 XMP") from error
+    descriptions = root.findall("./" + RDF + "RDF/" + RDF + "Description")
+    check_layout(len(descriptions) == 1)
+    desc = descriptions[0]
+    check_layout(desc.get(HDRGM + "Version") == "1.0")
+    if primary:
+        # Remove a packet only if every property belongs to the HDR declaration.
+        check_layout(root.tag == XMP + "xmpmeta" and len(root) == 1 and len(root[0]) == 1
+                     and set(root.attrib) <= {XMP + "xmptk"} and not root[0].attrib
+                     and len(desc) == 0 and set(desc.attrib) <= {
+                         RDF + "about", HDRGM + "Version", HDRGM + "BaseRenditionIsHDR"}
+                     and not desc.get(RDF + "about") and
+                     all(not (el.text or "").strip() and not (el.tail or "").strip() for el in root.iter()),
+                     "主图 XMP 含有其他信息")
+    check_layout(desc.get(HDRGM + "BaseRenditionIsHDR", "False" if primary else "").lower()
+                 in ("false", "0"), "主图本身为 HDR 或主图 HDR 状态不明确")
+
+
+def mp_index(order, entries):
+    """A single standard MP Index IFD: version, image count, then MP entries."""
+    def pack(fmt, *args):
+        return struct.pack(order + fmt, *args)
+    count = len(entries)
+    tiff = (b"II" if order == "<" else b"MM") + pack("HIH", 42, 8, 3)
+    tiff += pack("HHI", 0xb000, 7, 4) + b"0100"
+    tiff += pack("HHII", 0xb001, 4, 1, count)
+    tiff += pack("HHIII", 0xb002, 7, 16 * count, 50, 0)
+    return tiff + b"".join(pack("IIIHH", kind, size, offset, 0, 0) for kind, size, offset in entries)
+
+
+def keep_preview(path, record):
+    kinds = [0x30000, 0x10002, 0x50000]
+    check_layout(values(record, "NumberOfImages") == [3] and values(record, "FileType") == ["JPEG"])
+    rows = []
+    for index, kind in enumerate(kinds, 1):
+        tags = {key.split(":")[-1]: val for key, val in record.items()
+                if key.split(":")[0] == "MPImage" + str(index)}
+        check_layout(tags.get("MPImageFormat") == 0 and tags.get("MPImageType") == kind)
+        start, length = tags.get("MPImageStart"), tags.get("MPImageLength")
+        check_layout(isinstance(start, int) and isinstance(length, int) and start >= 0 and length >= 4)
+        rows.append((start, length))
+    data = path.read_bytes()
+    images, previous = [], 0
+    for start, length in rows:
+        check_layout(start >= previous and start + length <= len(data) and not any(data[previous:start]))
+        image = data[start:start + length]
+        check_layout(jpeg_end(image) == length)
+        images.append(image)
+        previous = start + length
+    check_layout(rows[0][0] == 0 and previous == len(data))
+    primary, preview, gain = images
+    sections = gain_segments(primary)
+    check_layout(set(sections) == {"xmp", "iso", "mpf"} and not gain_segments(preview))
+    check_gain_declarations(sections, True)
+    gain_tags = gain_segments(gain)
+    check_layout(set(gain_tags) == {"xmp", "iso"})
+    check_gain_declarations(gain_tags, False)
+    pos, _, original = sections["mpf"]
+    origin = pos + 8   # FF E2, length, "MPF\0", then TIFF offset zero
+    order = "<" if original.startswith(b"II") else ">"
+    check_layout(rows[1][0] >= origin and rows[2][0] >= origin)
+    entries = [(k, size, start - origin if start else 0) for k, (start, size) in zip(kinds, rows)]
+    # Exact comparison rejects extra IFD tags, dependency flags/indices and
+    # unaccounted data in the index rather than silently discarding them.
+    check_layout(original == mp_index(order, entries), "多图索引含有其他标记或依赖")
+    primary_size = len(primary) - 16
+    new_origin = origin
+    for kind in ("xmp", "iso"):
+        a, b, _ = sections[kind]
+        primary_size -= b - a
+        if a < pos:
+            new_origin -= b - a
+    tiff = mp_index(order, [(kinds[0], primary_size, 0), (kinds[1], len(preview), primary_size - new_origin)])
+    marker = b"\xff\xe2" + struct.pack(">H", len(tiff) + 6) + b"MPF\0" + tiff
+    for a, b, _ in sorted(sections.values(), reverse=True):
+        primary = primary[:a] + (marker if a == pos else b"") + primary[b:]
+    check_layout(len(primary) == primary_size)
+    return primary + preview
 
 
 def clear_file(path, stat):
@@ -185,18 +322,32 @@ def copy_original(path, destination, stat):
             raise RuntimeError(result.stderr.strip() or "无法复制原图")
 
 
-def clear_with_backup(path, stat):
+def clear_staged(path, stat, backup_enabled, preview_output=None):
     backup = path.with_name(path.name + "_original")
-    if os.path.lexists(backup):
+    if backup_enabled and os.path.lexists(backup):
         raise RuntimeError("同名备份已存在，原图未修改")
     if not os.access(path, os.W_OK):
         raise PermissionError("无法写入图片")
     with tempfile.TemporaryDirectory(prefix=".clear-jpg-hdr-", dir=path.parent) as scratch:
         work = Path(scratch) / "work.jpg"
         original = Path(scratch) / "original"
-        for destination in (work, original):
-            copy_original(path, destination, stat)
-        clear_file(work, stat)
+        copy_original(path, work, stat)
+        if backup_enabled:
+            copy_original(path, original, stat)
+        if preview_output is None:
+            clear_file(work, stat)
+        else:
+            with work.open("wb") as stream:
+                stream.write(preview_output)
+            checked = metadata(work)
+            primary_end = jpeg_end(preview_output)
+            if (values(checked, "NumberOfImages") != [2]
+                    or values(checked, "MPImageType") != [0x30000, 0x10002]
+                    or primary_end is None or values(checked, "MPImageStart") != [0, primary_end]
+                    or values(checked, "MPImageLength") != [primary_end, len(preview_output) - primary_end]
+                    or work.read_bytes() != preview_output):
+                raise RuntimeError("写入后预览图校验失败")
+            os.utime(work, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         current = path.lstat()
         if (current.st_dev, current.st_ino, current.st_ctime_ns, current.st_mtime_ns, current.st_size) != (
                 stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size):
@@ -205,18 +356,22 @@ def clear_with_backup(path, stat):
         if os.name == "nt":
             # Windows rename refuses to replace an existing backup. ReplaceFileW
             # merges the original file's ACLs, creation time and named streams.
-            os.rename(original, backup)
+            if backup_enabled:
+                os.rename(original, backup)
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
             if not kernel.ReplaceFileW(str(path), str(work), None, 0, None, None):
                 raise ctypes.WinError(ctypes.get_last_error())
+            # Merging NTFS named streams can update the replacement's last-write time.
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
             return
         # Darwin RENAME_EXCL publishes the completed backup without overwriting a collision.
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.renamex_np(os.fsencode(original), os.fsencode(backup), 0x00000004) != 0:
-            code = ctypes.get_errno()
-            if code == errno.EEXIST:
-                raise RuntimeError("同名备份已存在，原图未修改")
-            raise OSError(code, os.strerror(code), str(backup))
+        if backup_enabled:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.renamex_np(os.fsencode(original), os.fsencode(backup), 0x00000004) != 0:
+                code = ctypes.get_errno()
+                if code == errno.EEXIST:
+                    raise RuntimeError("同名备份已存在，原图未修改")
+                raise OSError(code, os.strerror(code), str(backup))
         os.replace(work, path)
 
 
@@ -263,14 +418,23 @@ def run(paths, backup=False):
             if stat.st_nlink > 1:
                 report["skipped"].append([str(path), "文件存在硬链接"])
                 continue
-            reason = skip_reason(path, metadata(path))
+            record = metadata(path)
+            preview_output = None
+            if values(record, "MPImageType") == [0x30000, 0x10002, 0x50000]:
+                try:
+                    preview_output = keep_preview(path, record)
+                    reason = None
+                except UnsupportedLayout as error:
+                    reason = str(error)
+            else:
+                reason = skip_reason(path, record)
             if reason:
                 report["skipped"].append([str(path), reason])
                 continue
             if os.name == "nt" and stat.st_file_attributes & stat_flags.FILE_ATTRIBUTE_READONLY:
                 raise PermissionError("图片为只读文件")
-            if backup:
-                clear_with_backup(path, stat)
+            if backup or preview_output is not None:
+                clear_staged(path, stat, backup, preview_output)
             else:
                 clear_file(path, stat)
             report["processed"].append(str(path))
@@ -279,22 +443,26 @@ def run(paths, backup=False):
     return report
 
 
-def notify(report):
-    if not report["failed"]:
-        return
-    summary = "已处理 {} 张，跳过 {} 项，失败 {} 项".format(
-        len(report["processed"]), len(report["skipped"]), len(report["failed"])
-    )
-    details = "\n".join(Path(path).name + "：" + reason for path, reason in report["failed"][:5])
-    script = ('on run argv\n'
-              'display dialog (item 1 of argv) with title (item 2 of argv) '
-              'buttons {"好"} default button "好" with icon caution\nend run')
-    message = summary + "\n\n" + details
-    result = subprocess.run(
-        ["/usr/bin/osascript", "-e", script, message, TITLE], capture_output=True, text=True,
-    )
-    if result.returncode:
-        print(result.stderr, file=sys.stderr)
+def menu_result(report):
+    processed, skipped, failed = (len(report[key]) for key in ("processed", "skipped", "failed"))
+    title = "清除成功" if processed else "处理完成"
+    if failed:
+        title = "部分照片清除失败" if processed else "清除失败"
+    message = f"成功 {processed} 个，跳过 {skipped} 个，失败 {failed} 个。"
+    if skipped:
+        reasons = Counter(reason for _, reason in report["skipped"])
+        message += "\n\n跳过原因\n" + "\n".join(
+            f"{reason}（{count} 个）" for reason, count in reasons.most_common(3)
+        )
+    if failed:
+        message += "\n\n失败原因\n" + "\n".join(
+            f"{Path(path).name}：{reason}" for path, reason in report["failed"][:5]
+        )
+        if failed > 5:
+            message += f"\n另有 {failed - 5} 个失败项。"
+    if not (processed or skipped or failed):
+        message += "\n所选位置没有 JPG/JPEG 图片。"
+    return dict(report, title=title, message=message)
 
 
 if __name__ == "__main__":
@@ -316,9 +484,6 @@ if __name__ == "__main__":
         outcome = run(paths, backup=options.backup)
     except ValueError as error:
         outcome = {"processed": [], "skipped": [], "failed": [["菜单请求", str(error)]]}
-    if os.name == "nt":
-        sys.stdout.reconfigure(encoding="utf-8")
-        print(json.dumps(outcome, ensure_ascii=False))
-        raise SystemExit(1 if outcome["failed"] else 0)
-    print(json.dumps(outcome, ensure_ascii=False, indent=2))
-    notify(outcome)
+    sys.stdout.reconfigure(encoding="utf-8")
+    print(json.dumps(menu_result(outcome), ensure_ascii=False))
+    raise SystemExit(1 if outcome["failed"] else 0)
