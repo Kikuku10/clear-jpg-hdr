@@ -1,0 +1,8 @@
+Official libavif test fixtures; license: libavif BSD 2-Clause (see libavif-LICENSE.txt).
+README: https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/README.md
+https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/paris_exif_xmp_gainmap_littleendian.jpg
+https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/paris_exif_xmp_gainmap_bigendian.jpg
+https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/paris_exif_xmp_icc_gainmap_bigendian.jpg
+
+Downloaded unchanged for local tests on 2026-11-14.
+Paris gain map fixtures use MPImageType=Undefined (0), and XMP GContainer semantic GainMap.
