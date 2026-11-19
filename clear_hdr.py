@@ -381,19 +381,11 @@ def is_link(path):
     return path.is_symlink()
 
 
-def run(paths, backup=False):
-    report = {"processed": [], "skipped": [], "failed": []}
-    if not EXIFTOOL or not os.access(EXIFTOOL, os.X_OK):
-        reason = "App 内的 ExifTool 缺失，请重新安装小工具" if BUNDLED else "未找到已安装的 ExifTool"
-        report["failed"].append(["ExifTool", reason])
-        return report
+def selected_files(paths, report):
     candidates = []
-    for raw_path in paths:
-        path = Path(raw_path).absolute()
+    for path in dict.fromkeys(Path(raw).absolute() for raw in paths):
         try:
-            if is_link(path):
-                report["skipped"].append([str(path), "不处理链接或重解析点"])
-            elif path.is_dir():
+            if not is_link(path) and path.is_dir():
                 candidates.extend(sorted(
                     (child for child in path.iterdir()
                      if child.suffix.lower() in (".jpg", ".jpeg")),
@@ -403,17 +395,48 @@ def run(paths, backup=False):
                 candidates.append(path)
         except OSError as error:
             report["failed"].append([str(path), str(error)])
-    seen = set()
-    for path in candidates:
+
+    # Deduplicate before edits: writing with a backup can replace a file's inode.
+    unique = {}
+    for path in dict.fromkeys(candidates):
         try:
-            if is_link(path) or not path.is_file() or path.suffix.lower() not in (".jpg", ".jpeg"):
+            stat = path.lstat()
+            identity = (stat.st_dev, stat.st_ino) if stat.st_ino else path
+        except OSError:
+            identity = path  # The per-file check below reports unreadable or missing items.
+        unique.setdefault(identity, path)
+    return unique
+
+
+def emit_progress(done, total):
+    print(f"PROGRESS {done} {total}", file=sys.stderr, flush=True)
+
+
+def run(paths, backup=False, progress=None):
+    report = {"processed": [], "skipped": [], "failed": []}
+    if not EXIFTOOL or not os.access(EXIFTOOL, os.X_OK):
+        reason = "App 内的 ExifTool 缺失，请重新安装小工具" if BUNDLED else "未找到已安装的 ExifTool"
+        report["failed"].append(["ExifTool", reason])
+        files = {}
+    else:
+        files = selected_files(paths, report)
+    checked = len(report["failed"])
+    total = checked + len(files)
+    if progress:
+        progress(0, total)
+        if checked:
+            progress(checked, total)
+    for done, (identity, path) in enumerate(files.items(), start=checked + 1):
+        try:
+            if is_link(path):
+                report["skipped"].append([str(path), "不处理链接或重解析点"])
+                continue
+            if not path.is_file() or path.suffix.lower() not in (".jpg", ".jpeg"):
                 report["skipped"].append([str(path), "只处理 JPG/JPEG 普通文件"])
                 continue
             stat = path.stat()
-            identity = (stat.st_dev, stat.st_ino) if stat.st_ino else os.path.normcase(str(path))
-            if identity in seen:
-                continue
-            seen.add(identity)
+            if isinstance(identity, tuple) and identity != (stat.st_dev, stat.st_ino):
+                raise RuntimeError("图片在准备期间已被替换")
             # In-place writes also affect other hard links, outside the Finder selection.
             if stat.st_nlink > 1:
                 report["skipped"].append([str(path), "文件存在硬链接"])
@@ -440,6 +463,9 @@ def run(paths, backup=False):
             report["processed"].append(str(path))
         except (OSError, ValueError, RuntimeError) as error:
             report["failed"].append([str(path), str(error)])
+        finally:
+            if progress:
+                progress(done, total)
     return report
 
 
@@ -469,6 +495,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backup", action="store_true", help="keep an original beside each edited JPEG")
     parser.add_argument("--stdin-paths", action="store_true", help="read a UTF-8 JSON array of absolute paths")
+    parser.add_argument("--progress", action="store_true", help="write per-item progress to stderr")
     parser.add_argument("paths", nargs="*")
     options = parser.parse_args()
     try:
@@ -481,9 +508,12 @@ if __name__ == "__main__":
                 isinstance(p, str) and os.path.isabs(p) and "\x00" not in p for p in paths
             ):
                 raise ValueError("菜单请求必须包含绝对文件路径")
-        outcome = run(paths, backup=options.backup)
+        outcome = run(paths, backup=options.backup, progress=emit_progress if options.progress else None)
     except ValueError as error:
         outcome = {"processed": [], "skipped": [], "failed": [["菜单请求", str(error)]]}
+        if options.progress:
+            emit_progress(0, 1)
+            emit_progress(1, 1)
     sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps(menu_result(outcome), ensure_ascii=False))
     raise SystemExit(1 if outcome["failed"] else 0)

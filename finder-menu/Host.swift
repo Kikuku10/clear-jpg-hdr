@@ -52,6 +52,62 @@ private struct ProcessingResult: Decodable {
     }
 }
 
+private final class ProgressStream {
+    let counts = Progress(totalUnitCount: -1)
+    private(set) var diagnostic = ""
+
+    func read(_ handle: FileHandle) {
+        var buffer = Data()
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let end = buffer.firstIndex(of: 10) {
+                receive(String(decoding: buffer[..<end], as: UTF8.self))
+                buffer.removeSubrange(...end)
+            }
+        }
+        if !buffer.isEmpty { receive(String(decoding: buffer, as: UTF8.self)) }
+    }
+
+    private func receive(_ line: String) {
+        let fields = line.split(separator: " ")
+        if fields.count == 3, fields[0] == "PROGRESS",
+           let done = Int64(fields[1]), let total = Int64(fields[2]), done >= 0, done <= total {
+            if counts.totalUnitCount != total { counts.totalUnitCount = total }
+            counts.completedUnitCount = done
+        } else if diagnostic.count < 1500 {
+            diagnostic += String((line + "\n").prefix(1500 - diagnostic.count))
+        }
+    }
+}
+
+private struct ProcessingView: View {
+    let counts: Progress
+
+    var body: some View {
+        // Sampling keeps a large, fast batch from queuing one UI update per file.
+        TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+            let total = counts.totalUnitCount
+            let done = counts.completedUnitCount
+            VStack(alignment: .leading, spacing: 10) {
+                if total >= 0 {
+                    Text("已处理 \(done) / \(total) 项").monospacedDigit()
+                } else {
+                    Text("正在统计照片…")
+                }
+                if total > 0 && (total > 1 || done > 0) {
+                    ProgressView(value: Double(done), total: Double(total))
+                } else {
+                    ProgressView()
+                }
+            }
+            .progressViewStyle(.linear)
+            .padding(20)
+        }
+    }
+}
+
 private struct SettingsPanel: View {
     @State var preferences: Preferences
     @State private var extensionEnabled = FIFinderSyncController.isExtensionEnabled
@@ -90,6 +146,14 @@ private struct SettingsPanel: View {
                     Text("例如，照片.jpg 的原图保存在同一文件夹的 照片.jpg_original。已有同名备份时会停止处理这张照片。")
                 }
             }
+            Section("画质说明") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("清除增益图不会降低 JPG 主图的清晰度或分辨率，但会移除原来的 HDR 高光效果。工具不会重新压缩主图。")
+                    Text("实测三份样本，处理前后的主图压缩数据和解码后的每个像素都相同，EXIF 和已有的 ICC 色彩配置也保持一致。")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -100,6 +164,7 @@ private struct SettingsPanel: View {
 
 final class HostDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
+    private var progressWindow: NSPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do { try prepareRequests() }
@@ -130,13 +195,26 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !isWorker }
+
+    private func showProgress(_ counts: Progress) {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 84),
+                            styleMask: [.titled, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.title = "正在清除 JPG HDR 增益图"
+        panel.contentView = NSHostingView(rootView: ProcessingView(counts: counts))
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.center()
+        panel.orderFrontRegardless()
+        progressWindow = panel
+    }
 
     private func showSettings() {
         if settingsWindow == nil {
             do {
                 let panel = SettingsPanel(preferences: try Preferences.load())
-                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 300),
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 442),
                                       styleMask: [.titled, .closable, .miniaturizable],
                                       backing: .buffered, defer: false)
                 window.title = appName
@@ -209,19 +287,34 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
         let input = try FileHandle(forReadingFrom: request)
         defer { try? input.close() }
         process.standardInput = input
-        process.arguments = ["-I", "-B", script.path, "--stdin-paths"] + (backup ? ["--backup"] : [])
+        process.arguments = ["-I", "-B", script.path, "--stdin-paths", "--progress"] + (backup ? ["--backup"] : [])
         let output = Pipe()
+        let events = Pipe()
         process.standardOutput = output
-        process.standardError = output
+        process.standardError = events
+        let progress = ProgressStream()
+        DispatchQueue.main.async { self.showProgress(progress.counts) }
+        defer {
+            DispatchQueue.main.async {
+                self.progressWindow?.close()
+                self.progressWindow = nil
+            }
+        }
         try process.run()
+        let reader = DispatchGroup()
+        DispatchQueue.global(qos: .userInitiated).async(group: reader) {
+            progress.read(events.fileHandleForReading)
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        reader.wait()
         if process.terminationReason == .exit,
            let result = try? JSONDecoder().decode(ProcessingResult.self, from: data),
            process.terminationStatus == (result.failed.isEmpty ? 0 : 1) {
             return result
         }
-        let detail = String(decoding: data.prefix(1500), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = (progress.diagnostic.isEmpty ? String(decoding: data.prefix(1500), as: UTF8.self)
+                      : progress.diagnostic).trimmingCharacters(in: .whitespacesAndNewlines)
         throw failure(detail.isEmpty ? "清除程序未返回结果（退出码 \(process.terminationStatus)）。" : detail)
     }
 

@@ -1,6 +1,7 @@
 """Exercise real ExifTool writes on disposable JPEG fixtures only."""
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -161,6 +162,7 @@ class ClearHDRTests(unittest.TestCase):
                                         input=json.dumps(list(map(str, paths))).encode(),
                                         capture_output=True, timeout=60)
                 self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stderr, b"")
                 report = json.loads(result.stdout)
                 self.assertIn(counts, report["message"])
                 self.assertTrue(report["title"])
@@ -169,6 +171,38 @@ class ClearHDRTests(unittest.TestCase):
                 if code:
                     self.assertIn(bad.name, report["message"])
                     self.assertIn(report["failed"][0][1], report["message"])
+
+    def test_cli_progress_counts_each_outcome_once(self):
+        photo = self.fixture("good.jpg")
+        self.fixture("skip.jpg", image_type=None)
+        (self.directory / "broken.jpg").write_bytes(b"\xff\xd8broken")
+        empty = self.directory / "empty"
+        empty.mkdir()
+        for selection, counts in (([self.directory, photo, self.directory], (1, 1, 1)),
+                                  ([empty], (0, 0, 0)), ({"bad": True}, (0, 0, 1))):
+            with self.subTest(counts=counts):
+                data = [str(path) for path in selection] if isinstance(selection, list) else selection
+                result = subprocess.run([sys.executable, str(ENGINE), "--stdin-paths", "--progress", "--backup"],
+                                        input=json.dumps(data).encode(), capture_output=True, timeout=60)
+                report = json.loads(result.stdout)
+                self.assertEqual(tuple(len(report[k]) for k in ("processed", "skipped", "failed")), counts)
+                self.assertEqual(result.returncode, int(counts[2] > 0))
+                total = sum(counts)
+                self.assertEqual(result.stderr.decode("ascii").splitlines(),
+                                 [f"PROGRESS {done} {total}" for done in range(total + 1)])
+
+    def test_progress_is_flushed_between_files(self):
+        photos = [self.fixture("first.jpg"), self.fixture("second.jpg")]
+        buffer = io.BytesIO()
+        def read_metadata(path):
+            done = photos.index(path)
+            self.assertEqual(buffer.getvalue().splitlines()[-1], f"PROGRESS {done} 2".encode())
+            return {"File:FileType": "JPEG"}
+        with io.TextIOWrapper(buffer, encoding="ascii") as stream, mock.patch.object(sys, "stderr", stream), \
+                mock.patch.object(clear_hdr, "metadata", side_effect=read_metadata):
+            result = clear_hdr.run(photos, progress=clear_hdr.emit_progress)
+            self.assertEqual(len(result["skipped"]), 2)
+            self.assertEqual(buffer.getvalue().splitlines()[-1], b"PROGRESS 2 2")
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="clear-hdr-test-")

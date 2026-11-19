@@ -55,12 +55,8 @@ namespace ClearJPGHDR
                     throw new ArgumentException("请选择要处理的 JPG 图片或文件夹。");
                 if (!ReadOption("MenuEnabled", true)) return 0;
                 Report report;
-                using (Mutex mutex = new Mutex(false, @"Local\ClearJPGHDR.PhotoWorker"))
-                {
-                    try { mutex.WaitOne(); } catch (AbandonedMutexException) { }
-                    try { report = ProcessPhotos(paths); }
-                    finally { mutex.ReleaseMutex(); }
-                }
+                using (var window = new ProgressWindow())
+                    report = window.ProcessSelection(paths);
                 bool failed = report.failed.Length != 0;
                 MessageBox.Show(report.message, report.title, MessageBoxButtons.OK,
                     failed ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
@@ -91,11 +87,81 @@ namespace ClearJPGHDR
             public string[][] failed { get; set; }
         }
 
-        private static Report ProcessPhotos(string[] paths)
+        private sealed class ProgressWindow : Form
+        {
+            private readonly Label status = new Label { Text = "正在准备处理…", AutoSize = true };
+            private readonly ProgressBar bar = new ProgressBar {
+                Width = 320, Height = 18, Style = ProgressBarStyle.Marquee, AccessibleName = "清除进度"
+            };
+            private volatile int handled;
+            private volatile int total = -1;
+            private volatile bool queued;
+            private bool finished;
+
+            internal ProgressWindow()
+            {
+                Text = "正在清除 JPG HDR 增益图";
+                Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                Font = SystemFonts.MessageBoxFont;
+                AutoScaleMode = AutoScaleMode.Font;
+                AutoSize = true;
+                AutoSizeMode = AutoSizeMode.GrowAndShrink;
+                ControlBox = false;
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                StartPosition = FormStartPosition.CenterScreen;
+                var layout = new TableLayoutPanel { ColumnCount = 1, AutoSize = true,
+                    Dock = DockStyle.Fill, Padding = new Padding(16) };
+                layout.Controls.Add(status);
+                layout.Controls.Add(bar);
+                Controls.Add(layout);
+                FormClosing += delegate(object sender, FormClosingEventArgs e) {
+                    if (!finished && e.CloseReason == CloseReason.UserClosing) e.Cancel = true;
+                };
+            }
+
+            internal Report ProcessSelection(string[] paths)
+            {
+                Task<Report> work = null;
+                using (var timer = new System.Windows.Forms.Timer { Interval = 100 })
+                {
+                    timer.Tick += delegate {
+                        int count = total, done = handled;
+                        if (count < 0) {
+                            status.Text = queued ? "正在等待前一批照片处理完成…" : "正在准备处理…";
+                            return;
+                        }
+                        status.Text = String.Format("已处理 {0} / {1}", done, count);
+                        bar.Style = count == 1 && done == 0 ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous;
+                        bar.Maximum = Math.Max(1, count);
+                        bar.Value = done;
+                    };
+                    Shown += delegate {
+                        timer.Start();
+                        work = Task.Run(() => {
+                            using (var mutex = new Mutex(false, @"Local\ClearJPGHDR.PhotoWorker"))
+                            {
+                                try {
+                                    if (!mutex.WaitOne(0)) { queued = true; mutex.WaitOne(); }
+                                } catch (AbandonedMutexException) { }
+                                queued = false;
+                                try { return ProcessPhotos(paths, (done, count) => { total = count; handled = done; }); }
+                                finally { mutex.ReleaseMutex(); }
+                            }
+                        });
+                        work.ContinueWith(completed => { finished = true; Close(); },
+                                          TaskScheduler.FromCurrentSynchronizationContext());
+                    };
+                    ShowDialog();
+                }
+                return work.GetAwaiter().GetResult();
+            }
+        }
+
+        private static Report ProcessPhotos(string[] paths, Action<int, int> progress)
         {
             string root = AppDomain.CurrentDomain.BaseDirectory;
             var start = new ProcessStartInfo(Path.Combine(root, @"runtime\python.exe"));
-            start.Arguments = "-I -B -X utf8 \"" + Path.Combine(root, "clear_hdr.py") + "\" --stdin-paths"
+            start.Arguments = "-I -B -X utf8 \"" + Path.Combine(root, "clear_hdr.py") + "\" --stdin-paths --progress"
                 + (ReadOption("BackupEnabled", false) ? " --backup" : "");
             start.WorkingDirectory = root;
             start.UseShellExecute = false;
@@ -106,21 +172,31 @@ namespace ClearJPGHDR
             using (var process = Process.Start(start))
             {
                 Task<string> output = process.StandardOutput.ReadToEndAsync();
-                Task<string> error = process.StandardError.ReadToEndAsync();
+                var errors = new StringBuilder();
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) {
+                    if (e.Data == null) return;
+                    string[] parts = e.Data.Split(' ');
+                    int done, count;
+                    if (parts.Length == 3 && parts[0] == "PROGRESS" && Int32.TryParse(parts[1], out done)
+                        && Int32.TryParse(parts[2], out count) && done >= 0 && done <= count)
+                        progress(done, count);
+                    else errors.AppendLine(e.Data);
+                };
+                process.BeginErrorReadLine();
                 var json = new JavaScriptSerializer { MaxJsonLength = Int32.MaxValue };
                 byte[] selection = Encoding.UTF8.GetBytes(json.Serialize(paths));
                 using (Stream input = process.StandardInput.BaseStream)
                     input.Write(selection, 0, selection.Length);
                 process.WaitForExit();
-                Task.WaitAll(output, error);
+                string error = errors.ToString().Trim();
                 if (String.IsNullOrWhiteSpace(output.Result))
-                    throw new IOException(String.IsNullOrWhiteSpace(error.Result) ? "照片处理程序未返回结果。" : error.Result.Trim());
+                    throw new IOException(error.Length == 0 ? "照片处理程序未返回结果。" : error);
                 var report = json.Deserialize<Report>(output.Result);
                 if (report == null || report.failed == null || String.IsNullOrEmpty(report.title)
                     || String.IsNullOrEmpty(report.message))
                     throw new IOException("无法读取照片处理结果。");
                 if (process.ExitCode != (report.failed.Length == 0 ? 0 : 1))
-                    throw new IOException("照片处理程序异常退出。\n" + error.Result.Trim());
+                    throw new IOException("照片处理程序异常退出。\n" + error);
                 return report;
             }
         }
@@ -152,6 +228,9 @@ namespace ClearJPGHDR
             Controls.Add(layout);
             AddSection(layout, "资源管理器右键菜单", menu, menuLocation);
             AddSection(layout, "照片处理", backup, backupHint);
+            AddSection(layout, "画质说明", new Label { AutoSize = true,
+                Text = "清除增益图不会降低 JPG 主图的清晰度或分辨率，但会移除原来的 HDR 高光效果。工具不会重新压缩主图。\n\n"
+                    + "实测三份样本，处理前后的主图压缩数据和解码后的每个像素都相同，EXIF 和已有的 ICC 色彩配置也保持一致。" });
             menu.Checked = ExplorerMenu.IsEnabled();
             backup.Checked = App.ReadOption("BackupEnabled", false);
             UpdateHints();
@@ -159,17 +238,20 @@ namespace ClearJPGHDR
             backup.Click += delegate { Save(backup, "BackupEnabled"); };
         }
 
-        private static void AddSection(TableLayoutPanel layout, string title, CheckBox option, Label hint)
+        private static void AddSection(TableLayoutPanel layout, string title, params Control[] controls)
         {
             var group = new GroupBox { Text = title, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 Dock = DockStyle.Fill, MinimumSize = new Size(420, 0), Padding = new Padding(14, 6, 14, 12),
                 Margin = new Padding(0, 4, 0, 8) };
             var contents = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false,
                 Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
-            hint.MaximumSize = new Size(400, 0);
-            hint.Margin = new Padding(3, 6, 3, 3);
-            contents.Controls.Add(option);
-            contents.Controls.Add(hint);
+            foreach (var control in controls) {
+                if (control is Label) {
+                    control.MaximumSize = new Size(400, 0);
+                    control.Margin = new Padding(3, 6, 3, 3);
+                }
+                contents.Controls.Add(control);
+            }
             group.Controls.Add(contents);
             layout.Controls.Add(group);
         }
