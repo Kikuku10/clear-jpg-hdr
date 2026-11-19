@@ -76,7 +76,9 @@ private struct SettingsPanel: View {
             } header: {
                 Text("照片处理")
             } footer: {
-                Text(preferences.backupEnabled ? "例如，照片.jpg 的原图保存在同一文件夹的 照片.jpg_original。已有同名备份时会停止处理这张照片。" : "直接覆盖原图。")
+                if preferences.backupEnabled {
+                    Text("例如，照片.jpg 的原图保存在同一文件夹的 照片.jpg_original。已有同名备份时会停止处理这张照片。")
+                }
             }
         }
         .formStyle(.grouped)
@@ -189,8 +191,12 @@ final class HostDelegate: NSObject, NSApplicationDelegate {
             throw failure("找不到清除程序。")
         }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [script.path] + (backup ? ["--backup"] : []) + ["--"] + paths
+        let python = hostURL.appendingPathComponent("Contents/Helpers/python3")
+        guard FileManager.default.isExecutableFile(atPath: python.path) else {
+            throw failure("App 内的 Python 不完整，请重新安装。")
+        }
+        process.executableURL = python
+        process.arguments = ["-I", "-B", script.path] + (backup ? ["--backup"] : []) + ["--"] + paths
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output

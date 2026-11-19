@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">清除JPG HDR小工具</title>
+  <defs>
+    <linearGradient id="tile" x1=".16" y1="0" x2=".81" y2="1">
+      <stop stop-color="#65385f"/>
+      <stop offset=".52" stop-color="#452644"/>
+      <stop offset="1" stop-color="#2a182f"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2=".18" y2="1">
+      <stop stop-color="#9c495b"/>
+      <stop offset="1" stop-color="#ed9974"/>
+    </linearGradient>
+    <linearGradient id="foil" x1="1" y1="0" x2=".12" y2=".90">
+      <stop stop-color="#ffecb5"/>
+      <stop offset=".48" stop-color="#ffc06c"/>
+      <stop offset="1" stop-color="#f18b50"/>
+    </linearGradient>
+    <clipPath id="landscape">
+      <path d="M309 365h208l187 187v87c0 11-8 19-19 19H309c-11 0-19-8-19-19V384c0-11 8-19 19-19Z"/>
+    </clipPath>
+  </defs>
+  <rect x="102" y="102" width="820" height="820" rx="181" fill="url(#tile)"/>
+  <path d="M309 330h225l212 212v124c0 39-30 69-69 69H309c-39 0-69-30-69-69V399c0-39 30-69 69-69Z" fill="#231429" opacity=".42"/>
+  <path d="M309 316h225l212 212v124c0 39-30 69-69 69H309c-39 0-69-30-69-69V385c0-39 30-69 69-69Z" fill="#fff1d9"/>
+  <g clip-path="url(#landscape)">
+    <path fill="url(#sky)" d="M290 365h414v293H290z"/>
+    <circle cx="398" cy="457" r="48" fill="#ffd88e"/>
+    <path d="M272 621l114-85c10-8 21-8 32 0l89 67 135-154 83 106v134H272Z" fill="#a34f62"/>
+    <path d="M272 694v-23l228-208c9-8 21-8 30 0l192 174v57Z" fill="#52304e"/>
+  </g>
+  <path d="M575 276h139c38 0 68 30 68 68v139Z" fill="url(#foil)"/>
+  <path d="M653 331h65" fill="none" stroke="#7e3841" stroke-width="25" stroke-linecap="round"/>
+</svg>

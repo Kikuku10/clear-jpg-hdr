@@ -14,9 +14,15 @@ import tempfile
 
 
 TITLE = "清除JPG HDR小工具"
-EXIFTOOL = next((path for path in (
-    "/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/opt/local/bin/exiftool",
-) if os.path.isfile(path) and os.access(path, os.X_OK)), None)
+# The installed app must be independent of the developer's Homebrew environment.
+RESOURCES = Path(__file__).resolve().parent
+BUNDLED = RESOURCES.name == "Resources" and RESOURCES.parent.name == "Contents"
+if BUNDLED:
+    EXIFTOOL = str(RESOURCES / "exiftool/bin/exiftool")
+else:
+    EXIFTOOL = next((path for path in (
+        "/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/opt/local/bin/exiftool",
+    ) if os.path.isfile(path) and os.access(path, os.X_OK)), None)
 READ_TAGS = [
     "-FileType", "-NumberOfImages", "-MPImageType", "-MPImageLength",
     "-MPImageStart", "-MPImageFormat", "-XMP-hdrgm:All", "-XMP-GContainer:All",
@@ -168,7 +174,8 @@ def clear_with_backup(path, stat):
 def run(paths, backup=False):
     report = {"processed": [], "skipped": [], "failed": []}
     if not EXIFTOOL or not os.access(EXIFTOOL, os.X_OK):
-        report["failed"].append(["ExifTool", "未找到已安装的 ExifTool"])
+        reason = "App 内的 ExifTool 缺失，请重新安装小工具" if BUNDLED else "未找到已安装的 ExifTool"
+        report["failed"].append(["ExifTool", reason])
         return report
     candidates = []
     for raw_path in paths:

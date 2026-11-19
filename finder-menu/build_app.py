@@ -1,18 +1,21 @@
 #!/usr/bin/python3
-"""Build and ad-hoc sign the local Finder menu app; do not install it."""
+"""Build a self-contained Finder app and optionally a drag-to-install DMG."""
 
+import argparse
 import platform
 import plistlib
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "清除JPG HDR小工具"
 APP_ID = "local.mimi.ClearJPGHDR"
 EXT_ID = APP_ID + ".FinderMenu"
+VERSION = "1.2.0"
 
 
 def run(*arguments):
@@ -49,12 +52,16 @@ def build(output):
         "-Xlinker", "-e", "-Xlinker", "_NSExtensionMain",
         "-o", str(extension / "Contents/MacOS/FinderMenu"), str(ROOT / "FinderMenu.swift"))
     shutil.copy2(ROOT.parent / "clear_hdr.py", app / "Contents/Resources/clear_hdr.py")
+    shutil.copyfile(ROOT.parent / "assets/AppIcon.icns", app / "Contents/Resources/AppIcon.icns")
+    pack = ROOT.parent / "packaging"
+    run(sys.executable, str(pack / "bundle_python.py"), str(app), "--arch", platform.machine())
+    run(sys.executable, str(pack / "bundle_exiftool.py"), str(app / "Contents/Resources"))
 
     base = {
         "CFBundleDevelopmentRegion": "zh_CN",
         "CFBundleInfoDictionaryVersion": "6.0",
-        "CFBundleShortVersionString": "1.1",
-        "CFBundleVersion": "4",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": "5",
         "CFBundleSupportedPlatforms": ["MacOSX"],
         "LSMinimumSystemVersion": "13.0",
         "LSUIElement": True,
@@ -66,6 +73,7 @@ def build(output):
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundlePackageType": "APPL",
+        "CFBundleIconFile": "AppIcon.icns",
     }))
     write_plist(extension / "Contents/Info.plist", dict(base, **{
         "CFBundleExecutable": "FinderMenu",
@@ -102,7 +110,22 @@ def build(output):
     return app
 
 
+def make_dmg(app):
+    dmg = app.parent / ("ClearJPGHDR-{}-{}.dmg".format(VERSION, platform.machine()))
+    with tempfile.TemporaryDirectory(prefix="clear-jpg-hdr-dmg-") as directory:
+        stage = Path(directory)
+        run("/usr/bin/ditto", str(app), str(stage / app.name))
+        (stage / "Applications").symlink_to("/Applications")
+        run("/usr/bin/hdiutil", "create", "-fs", "HFS+", "-format", "UDZO",
+            "-volname", APP_NAME, "-srcfolder", directory, str(dmg))
+    run("/usr/bin/hdiutil", "verify", str(dmg))
+    return dmg
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 2:
-        raise SystemExit("Usage: build_app.py [new-output-directory]")
-    print(build(sys.argv[1] if len(sys.argv) == 2 else ROOT / "build"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path, nargs="?", default=ROOT / "build")
+    parser.add_argument("--dmg", action="store_true")
+    args = parser.parse_args()
+    app = build(args.output)
+    print(make_dmg(app) if args.dmg else app)
