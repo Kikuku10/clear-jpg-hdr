@@ -6,13 +6,13 @@
 
 ### Windows
 
-运行 `ClearJPGHDR-1.3.0-windows-x64-setup.exe` 安装到当前账户。支持 Windows 10/11 x64 和可运行 x64 应用的 Windows 11 on Arm。Python、ExifTool 和 Perl 随安装包提供。从开始菜单打开「清除JPG HDR小工具」可以切换右键菜单、设置原图备份。卸载入口在 Windows「已安装的应用」中。
+下载并运行 [Windows 安装程序](https://github.com/Kikuku10/clear-jpg-hdr/releases/download/v1.3.0/ClearJPGHDR-1.3.0-windows-x64-setup.exe)，安装到当前账户。支持 Windows 10/11 x64 和可运行 x64 应用的 Windows 11 on Arm。Python、ExifTool 和 Perl 随安装包提供。从开始菜单打开「清除JPG HDR小工具」可以切换右键菜单、设置原图备份。卸载入口在 Windows「已安装的应用」中。
 
 Windows 10 的操作在右键菜单内。Windows 11 普通安装后，入口在 **右键 → 显示更多选项 → 清除 JPG HDR 增益图**。设置窗口会显示当前菜单位置。系统已启用开发者模式，或部署方已为随附的菜单身份包提供 Windows 信任的签名时，可注册 Windows 11 新版一级菜单。
 
 ### macOS
 
-1. 在 [GitHub Releases](https://github.com/Kikuku10/clear-jpg-hdr/releases/latest) 下载适合自己 Mac 的 DMG。Apple 芯片选 `arm64`，Intel 选 `x86_64`。最低系统版本为 macOS 13。
+1. 在 [macOS 下载页](https://github.com/Kikuku10/clear-jpg-hdr/releases/tag/v1.2.0) 下载适合自己 Mac 的 DMG。Apple 芯片选 `arm64`，Intel 选 `x86_64`。最低系统版本为 macOS 13。
 2. 打开 DMG，将「清除JPG HDR小工具」拖到旁边的「Applications」文件夹。Python、Perl 和 ExifTool 均随 App 安装。
 3. 从「应用程序」启动小工具，点击「管理扩展…」启用 Finder 扩展，然后右键选择照片或文件夹。
 
