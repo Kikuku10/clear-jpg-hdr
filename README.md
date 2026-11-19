@@ -10,19 +10,25 @@
 
 ## 下载与安装
 
+| 平台 | 1.3.2 安装包 |
+| --- | --- |
+| Mac · Apple 芯片（M 系列） | [下载 arm64 DMG](https://github.com/Kikuku10/clear-jpg-hdr/releases/download/v1.3.2/ClearJPGHDR-1.3.2-arm64.dmg) |
+| Mac · Intel 处理器 | [下载 x86_64 DMG](https://github.com/Kikuku10/clear-jpg-hdr/releases/download/v1.3.2/ClearJPGHDR-1.3.2-x86_64.dmg) |
+| Windows | [下载 x64 安装程序](https://github.com/Kikuku10/clear-jpg-hdr/releases/download/v1.3.2/ClearJPGHDR-1.3.2-windows-x64-setup.exe) |
+
 ### Windows
 
-下载并运行 [Windows 安装程序](https://github.com/Kikuku10/clear-jpg-hdr/releases/download/v1.3.0/ClearJPGHDR-1.3.0-windows-x64-setup.exe)，安装到当前账户。支持 Windows 10/11 x64 和可运行 x64 应用的 Windows 11 on Arm。Python、ExifTool 和 Perl 随安装包提供。从开始菜单打开「清除JPG HDR小工具」可以切换右键菜单、设置原图备份。卸载入口在 Windows「已安装的应用」中。
+运行安装程序，安装到当前账户。支持 Windows 10/11 x64 和可运行 x64 应用的 Windows 11 on Arm。Python、ExifTool 和 Perl 随安装包提供。从开始菜单打开「清除JPG HDR小工具」可以切换右键菜单、设置原图备份。卸载入口在 Windows「已安装的应用」中。
 
 Windows 10 的操作在右键菜单内。Windows 11 普通安装后，入口在 **右键 → 显示更多选项 → 清除 JPG HDR 增益图**。设置窗口会显示当前菜单位置。系统已启用开发者模式，或部署方已为随附的菜单身份包提供 Windows 信任的签名时，可注册 Windows 11 新版一级菜单。
 
 ### macOS
 
-1. 在 [macOS 下载页](https://github.com/Kikuku10/clear-jpg-hdr/releases/tag/v1.2.0) 下载适合自己 Mac 的 DMG。Apple 芯片选 `arm64`，Intel 选 `x86_64`。最低系统版本为 macOS 13。
+1. 在「关于本机」查看芯片或处理器，下载上表对应的 DMG。最低系统版本为 macOS 13。
 2. 打开 DMG，将「清除JPG HDR小工具」拖到旁边的「Applications」文件夹。Python、Perl 和 ExifTool 均随 App 安装。
 3. 从「应用程序」启动小工具，点击「管理扩展…」启用 Finder 扩展，然后右键选择照片或文件夹。
 
-v1.2.0 使用本地签名，未经 Apple 公证。首次启动若被 Gatekeeper 拦截，可在核实下载来源后按 [Apple 的首次打开说明](https://support.apple.com/zh-cn/102445) 操作。
+本版使用本地签名，未经 Apple 公证。首次启动若被 Gatekeeper 拦截，可在核实下载来源后按 [Apple 的首次打开说明](https://support.apple.com/zh-cn/102445) 操作。
 
 ## 设置
 
@@ -40,8 +46,6 @@ v1.2.0 使用本地签名，未经 Apple 公证。首次启动若被 Gatekeeper 
 从 1.3.2 起，清除时会显示进度窗口。扫描所选文件或文件夹后，进度条按已处理项数和总数更新。成功、跳过和失败的项目都会计入进度，结束后自动切换到结果汇总。
 
 支持 MPF 中明确标记为「主图＋增益图」的 JPEG，也支持已验证的「主图＋大预览图＋增益图」相机 JPEG。后一种只移除增益图及其声明，保留原有预览图，并更新多图索引。普通 JPEG、主图自身为 HDR、增益图未明确标记或多图结构无法安全识别时，工具会跳过该文件。
-
-上方链接的 macOS 1.2.0 和 Windows 1.3.0 安装包只支持两图格式，成功或跳过时静默。三图支持和结果弹窗已包含在当前源码中。
 
 ## 从源码构建
 
